@@ -1,0 +1,58 @@
+{
+  "default": "No access",
+  "desired_state_version": "v4.1",
+  "permissions": {
+    "actions": "read",
+    "checks": "read",
+    "contents": "read",
+    "discussions": "read",
+    "issues": "read",
+    "metadata": "read",
+    "pull_requests": "read",
+    "statuses": "read"
+  },
+  "profile": "gateway",
+  "role": "Gateway \u2014 oreille du regime, lecture seule",
+  "subscriptions": [
+    {
+      "consumer": "Issue Factory (declenchement fabrication)",
+      "event": "issues"
+    },
+    {
+      "consumer": "Suivi de boucle Factory / Mesh",
+      "event": "issue_comment"
+    },
+    {
+      "consumer": "Agent Mesh (revue sous Rick)",
+      "event": "pull_request"
+    },
+    {
+      "consumer": "Recus de revue (P3)",
+      "event": "pull_request_review"
+    },
+    {
+      "consumer": "Canaux types S1/S2/S3 (trafic de lane)",
+      "event": "discussion"
+    },
+    {
+      "consumer": "Canaux types (suivi)",
+      "event": "discussion_comment"
+    },
+    {
+      "consumer": "Etat CI pour le tableau de dispatch",
+      "event": "check_run"
+    },
+    {
+      "consumer": "Etat CI pour le tableau de dispatch",
+      "event": "check_suite"
+    },
+    {
+      "consumer": "Runs de factory (etats d'execution)",
+      "event": "workflow_run"
+    },
+    {
+      "consumer": "Recus R10 en statuts (correlation ingress <-> preuve)",
+      "event": "status"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "default": "No access",
+  "desired_state_version": "v4.1",
+  "permissions": {
+    "actions": "read",
+    "checks": "read",
+    "contents": "write",
+    "discussions": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write",
+    "statuses": "write"
+  },
+  "profile": "s3",
+  "role": "S3 Workers (Compagnons) \u2014 statuses: write porte le recu de l'executant (design section 0.3)"
+}

@@ -1,0 +1,16 @@
+{
+  "default": "No access",
+  "desired_state_version": "v4.1",
+  "permissions": {
+    "actions": "read",
+    "checks": "read",
+    "contents": "read",
+    "discussions": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "read",
+    "statuses": "read"
+  },
+  "profile": "a0",
+  "role": "A0 Orchestrator"
+}

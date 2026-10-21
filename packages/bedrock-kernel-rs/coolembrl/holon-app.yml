@@ -18,15 +18,24 @@ mcp:
         - boot_receipt_last
   mutating_tools: []
 api:
-  read_only: true
+  read_only: true # hors service d'enveloppe (Phase 2)
   routes:
     - GET /health
     - GET /boot
     - GET /state
+    - POST /envelope/claim
+    - POST /envelope/effect
+    - GET /envelope/state
+    - GET /envelope/proof
 anchor:
-  mechanism: ABSENT # mecanisme d'enveloppe : Phase 2
-  policy: DENY_ALL
-  capabilities_granted: 0
+  mechanism: ABSENT # ACTIVE seulement apres l'acte d'activation post-preuves H-P2
+  policy: DENY_ALL # surface brute /anchor : refus types uniquement
+  capabilities_granted: 0 # a vide ; en service = capacites des baux vivants (etat lu au store)
+authority_tools:
+  # Outils hors daemon des profils des cinq Apps (aucun effet externe).
+  - authority/compile_profiles.py
+  - authority/reconcile_profiles.py
+  - authority/check_profiles.py
 watchdog:
   status: NOT_INSTALLED # service N2 : Phase 4
   slot: GET /state (champ watchdog)
