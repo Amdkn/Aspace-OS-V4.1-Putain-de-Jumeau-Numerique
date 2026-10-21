@@ -17,19 +17,22 @@
 //! programme ; aucune reprise de code d'un daemon tiers, aucun identifiant
 //! de marque tierce (H-P1-5 / H-P1-11).
 
+mod envelope;
 mod journal;
+mod policy;
 mod server;
 mod store;
 mod timefmt;
 
+use envelope::EnvelopeService;
 use journal::Journal;
 use serde_json::{json, Value};
-use server::{AnchorState, DaemonState, ServerCtx};
+use server::{DaemonState, ServerCtx};
 use std::io::Read;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use store::Store;
 
@@ -49,6 +52,7 @@ struct Config {
     board_id: String,
     l00_trace: Option<PathBuf>,
     registry_path: Option<PathBuf>,
+    policy_dir: Option<PathBuf>,
     heartbeat_secs: u64,
 }
 
@@ -62,6 +66,7 @@ impl Config {
             board_id: env_or("NOYAU_BOARD_ID", "amd64-generic"),
             l00_trace: std::env::var("NOYAU_L00_TRACE").ok().map(PathBuf::from),
             registry_path: std::env::var("NOYAU_REGISTRY_PATH").ok().map(PathBuf::from),
+            policy_dir: std::env::var("NOYAU_POLICY_DIR").ok().map(PathBuf::from),
             heartbeat_secs: std::env::var("NOYAU_HEARTBEAT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -94,6 +99,40 @@ const TMPFS_MAGIC: u64 = 0x0102_1994;
 const RAMFS_MAGIC: u64 = 0x8584_58f6;
 
 fn main() {
+    // Acte d'activation de l'ancrage (Phase 2, design 0.1) : le mecanisme
+    // ne se declare ACTIVE qu'apres ses preuves — cet acte d'operateur,
+    // trace au store, est la seule voie d'activation.
+    if std::env::args().nth(1).as_deref() == Some("anchor-activate") {
+        let cfg = Config::from_env();
+        let store_path = cfg.data_dir.join("noyau-store.sqlite");
+        match Store::open(&store_path) {
+            Ok(store) => {
+                let now = timefmt::now_unix_secs();
+                match store.set_anchor_mechanism("ACTIVE") {
+                    Ok(()) => {
+                        let _ = store.trace(
+                            "ANCHOR_ACTIVATED",
+                            None,
+                            None,
+                            None,
+                            &json!({"act": "anchor-activate", "by": "operateur local"}).to_string(),
+                            now,
+                        );
+                        println!("noyau: ancrage ACTIVE — acte trace au store ({}).", store_path.display());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("noyau: anchor-activate FAILED — {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("noyau: anchor-activate FAILED — store illisible: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     let boot_start = Instant::now();
     let cfg = Config::from_env();
     let t0_unix = timefmt::now_unix_secs();
@@ -149,7 +188,6 @@ fn main() {
         t0_unix,
         stage_marks: vec![("S0 process-start".to_string(), t0_at.clone())],
         store_integrity: "UNKNOWN".to_string(),
-        anchor: AnchorState::phase1(),
         last_receipt: None,
         anomalies: anomalies.clone(),
     }));
@@ -188,7 +226,7 @@ fn main() {
     let store_path = cfg.data_dir.join("noyau-store.sqlite");
     match Store::open(&store_path) {
         Ok(s) => {
-            ctx.store = Some(s);
+            ctx.store = Some(Arc::new(Mutex::new(s)));
             ctx.state.write().unwrap().store_integrity = "OK".to_string();
         }
         Err(detail) => {
@@ -200,10 +238,13 @@ fn main() {
 
     // ---------- S3 replay ----------
     {
-        let store = ctx.store.as_ref().unwrap();
+        let store = ctx.store.as_ref().unwrap().lock().unwrap();
         match store.replay() {
             Ok(r) => ctx.replay = Some((r.hops_replayed, r.effects_unknown_pending)),
-            Err(detail) => ctx.fail("replay", &detail),
+            Err(detail) => {
+                drop(store);
+                ctx.fail("replay", &detail);
+            }
         }
     }
     ctx.mark("S3 replay");
@@ -228,6 +269,10 @@ fn main() {
     let server_ctx = Arc::new(ServerCtx {
         state: state.clone(),
         journal: journal.clone(),
+        envelope: Arc::new(EnvelopeService {
+            store: ctx.store.as_ref().unwrap().clone(),
+            policy_dir: cfg.policy_dir.clone(),
+        }),
     });
     {
         let c = server_ctx.clone();
@@ -406,7 +451,7 @@ struct BootCtx<'a> {
     t0_unix: i64,
     prev_boot_id: Option<String>,
     anomalies: Vec<String>,
-    store: Option<Store>,
+    store: Option<Arc<Mutex<Store>>>,
     replay: Option<(i64, i64)>,
     boot_start: Instant,
 }
@@ -429,6 +474,7 @@ impl<'a> BootCtx<'a> {
     /// classe : meme traitement que le succes.
     fn emit_receipt(&self, receipt: &Value, recorded_unix: i64) {
         if let Some(store) = &self.store {
+            let store = store.lock().unwrap();
             let _ = store.record_boot_receipt(&self.boot_id, &receipt.to_string(), recorded_unix);
         }
         let dir = self.cfg.data_dir.join("receipts");

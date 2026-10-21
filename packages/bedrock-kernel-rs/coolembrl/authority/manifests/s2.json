@@ -1,0 +1,16 @@
+{
+  "default": "No access",
+  "desired_state_version": "v4.1",
+  "permissions": {
+    "actions": "read",
+    "checks": "read",
+    "contents": "write",
+    "discussions": "write",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write",
+    "statuses": "write"
+  },
+  "profile": "s2",
+  "role": "S2 Managers (Doctors) \u2014 contents: write porte le no-human-gate (design section 0.2)"
+}

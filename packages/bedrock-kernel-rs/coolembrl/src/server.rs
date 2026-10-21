@@ -8,6 +8,7 @@
 //!   facon typee, toute mutation presentee (design section 0.4). Elle
 //!   n'ecrit aucun etat ; chaque presentation est consignee au journal.
 
+use crate::envelope::EnvelopeService;
 use crate::journal::Journal;
 use crate::timefmt;
 use serde_json::{json, Value};
@@ -18,43 +19,37 @@ use std::time::Duration;
 
 pub const MCP_TOOLS: [&str; 3] = ["daemon_status", "boot_state", "boot_receipt_last"];
 
-#[derive(Clone)]
-pub struct AnchorState {
-    pub mechanism: &'static str, // "ABSENT" en Phase 1 — honnetete par construction
-    pub policy: &'static str,    // "DENY_ALL"
-    pub capabilities_granted: i64,
+/// Etat de l'ancrage, lu EN DIRECT au store (Phase 2) : le mecanisme est
+/// ABSENT jusqu'a l'acte d'activation, puis ACTIVE (design Phase 2, 0.1) ;
+/// la politique reste le deny-by-default — rien n'est servi sans enveloppe
+/// autorisee ; les capacites accordees sont l'etat reel des baux vivants.
+pub fn anchor_json(mechanism: &str, capabilities_granted: i64) -> Value {
+    json!({
+        "mechanism": mechanism,
+        "mechanism_note": if mechanism == "ACTIVE" {
+            "service d'enveloppe en execution (Phase 2)"
+        } else {
+            "mecanisme non active — activation apres preuves H-P2 (Phase 2)"
+        },
+        "policy": "DENY_ALL",
+        "capabilities_granted": capabilities_granted,
+    })
 }
 
-impl AnchorState {
-    pub fn phase1() -> Self {
-        AnchorState {
-            mechanism: "ABSENT",
-            policy: "DENY_ALL",
-            capabilities_granted: 0,
+/// La seule reponse de la surface d'ancrage brute : un refus type.
+/// Toute reponse en forme de succes ou de bail simule serait une
+/// violation de design (H-P1-8) — les mutations passent par le service
+/// d'enveloppe (/envelope/*), jamais par cette surface.
+pub fn anchor_refusal(mechanism: &str, capabilities_granted: i64, presented: &Value) -> Value {
+    json!({
+        "error": {
+            "code": "ANCHOR_DENY_ALL",
+            "type": "typed_refusal",
+            "message": "ancrage d'autorite en deny-by-default : les mutations se presentent au service d'enveloppe (/envelope/effect), jamais a la surface brute",
+            "anchor": anchor_json(mechanism, capabilities_granted),
+            "presented_kind": presented.get("kind").cloned().unwrap_or(Value::Null),
         }
-    }
-    pub fn to_json(&self) -> Value {
-        json!({
-            "mechanism": self.mechanism,
-            "mechanism_note": "mecanisme d'enveloppe : Phase 2",
-            "policy": self.policy,
-            "capabilities_granted": self.capabilities_granted,
-        })
-    }
-    /// La seule reponse de l'ancrage en Phase 1 : un refus type.
-    /// Toute reponse en forme de succes ou de bail simule serait une
-    /// violation de design (H-P1-8).
-    pub fn refusal(&self, presented: &Value) -> Value {
-        json!({
-            "error": {
-                "code": "ANCHOR_DENY_ALL",
-                "type": "typed_refusal",
-                "message": "ancrage d'autorite en deny-by-default : aucune mutation n'est servie en Phase 1",
-                "anchor": self.to_json(),
-                "presented_kind": presented.get("kind").cloned().unwrap_or(Value::Null),
-            }
-        })
-    }
+    })
 }
 
 pub struct DaemonState {
@@ -65,13 +60,12 @@ pub struct DaemonState {
     pub t0_unix: i64,
     pub stage_marks: Vec<(String, String)>, // (etape, iso8601)
     pub store_integrity: String,
-    pub anchor: AnchorState,
     pub last_receipt: Option<Value>,
     pub anomalies: Vec<String>,
 }
 
 impl DaemonState {
-    pub fn state_json(&self) -> Value {
+    pub fn state_json(&self, anchor: &Value) -> Value {
         json!({
             "daemon": "noyau",
             "daemon_version": self.daemon_version,
@@ -81,7 +75,7 @@ impl DaemonState {
             "watchdog": "NOT_INSTALLED",
             "watchdog_note": "emplacement prepare ; service N2 : Phase 4",
             "store_integrity": self.store_integrity,
-            "anchor": self.anchor.to_json(),
+            "anchor": anchor,
             "anomalies": self.anomalies,
         })
     }
@@ -103,6 +97,15 @@ impl DaemonState {
 pub struct ServerCtx {
     pub state: Arc<RwLock<DaemonState>>,
     pub journal: Arc<Journal>,
+    pub envelope: Arc<EnvelopeService>,
+}
+
+fn live_anchor(ctx: &ServerCtx) -> Value {
+    let st = ctx.envelope.state_json();
+    anchor_json(
+        st.get("mechanism").and_then(|m| m.as_str()).unwrap_or("ABSENT"),
+        st.get("capabilities_granted").and_then(|c| c.as_i64()).unwrap_or(0),
+    )
 }
 
 // ---------- transport HTTP minimal (std uniquement) ----------
@@ -186,19 +189,57 @@ fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
 // ---------- API ----------
 
 fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
+    let path_only = req.path.split('?').next().unwrap_or("");
+    // --- service d'enveloppe (Phase 2) : point de controle unique
+    if req.method == "POST" && (path_only == "/envelope/claim" || path_only == "/envelope/effect") {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let out = if path_only == "/envelope/claim" {
+            ctx.envelope.claim(&body)
+        } else {
+            ctx.envelope.effect(&body)
+        };
+        return (out.status, out.body);
+    }
+    if req.method == "GET" && path_only == "/envelope/state" {
+        return (200, ctx.envelope.state_json());
+    }
+    if req.method == "GET" && path_only == "/envelope/proof" {
+        let query = req.path.split('?').nth(1).unwrap_or("");
+        let mut mission = "";
+        let mut operation = "";
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "mission_id" => mission = v,
+                    "operation_id" => operation = v,
+                    _ => {}
+                }
+            }
+        }
+        let out = ctx.envelope.proof(mission, operation);
+        return (out.status, out.body);
+    }
     let state = ctx.state.read().unwrap();
-    match (req.method.as_str(), req.path.as_str()) {
+    match (req.method.as_str(), path_only) {
         ("GET", "/health") => (
             200,
             json!({"status": "ok", "daemon": "noyau", "stage": state.stage, "boot_id": state.boot_id}),
         ),
         ("GET", "/boot") => (200, state.boot_json()),
-        ("GET", "/state") => (200, state.state_json()),
+        ("GET", "/state") => {
+            let anchor = live_anchor(ctx);
+            (200, state.state_json(&anchor))
+        }
         ("POST", "/anchor") => {
-            // Surface d'ancrage : refus type, consigne au journal.
+            // Surface d'ancrage brute : refus type, consigne au journal.
             let presented: Value =
                 serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-            let refusal = state.anchor.refusal(&presented);
+            let anchor = live_anchor(ctx);
+            let refusal = anchor_refusal(
+                anchor.get("mechanism").and_then(|m| m.as_str()).unwrap_or("ABSENT"),
+                anchor.get("capabilities_granted").and_then(|c| c.as_i64()).unwrap_or(0),
+                &presented,
+            );
             drop(state);
             ctx.journal.append(&json!({
                 "kind": "anchor-refusal",
@@ -212,11 +253,11 @@ fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
         }
         ("GET", _) | ("POST", _) => (
             404,
-            json!({"error": {"code": "NOT_FOUND", "message": "surface inexistante — la liste des surfaces de T1 est fermee (design Phase 1, section 2.3)"}}),
+            json!({"error": {"code": "NOT_FOUND", "message": "surface inexistante — les surfaces du daemon sont celles des designs signes (Phase 1 section 2.3, Phase 2 : service d'enveloppe)"}}),
         ),
         _ => (
             405,
-            json!({"error": {"code": "METHOD_NOT_ALLOWED", "message": "API lecture seule ; la surface d'ancrage ne sert que des refus types"}}),
+            json!({"error": {"code": "METHOD_NOT_ALLOWED", "message": "API lecture seule hors service d'enveloppe ; la surface d'ancrage brute ne sert que des refus types"}}),
         ),
     }
 }
@@ -226,7 +267,7 @@ fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
 fn mcp_tool_result(ctx: &ServerCtx, name: &str) -> Value {
     let state = ctx.state.read().unwrap();
     match name {
-        "daemon_status" => state.state_json(),
+        "daemon_status" => state.state_json(&live_anchor(ctx)),
         "boot_state" => state.boot_json(),
         "boot_receipt_last" => state
             .last_receipt
