@@ -11,6 +11,7 @@
 use crate::envelope::EnvelopeService;
 use crate::journal::Journal;
 use crate::timefmt;
+use crate::workgraph::WorkGraph;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -98,6 +99,7 @@ pub struct ServerCtx {
     pub state: Arc<RwLock<DaemonState>>,
     pub journal: Arc<Journal>,
     pub envelope: Arc<EnvelopeService>,
+    pub workgraph: Arc<WorkGraph>,
 }
 
 fn live_anchor(ctx: &ServerCtx) -> Value {
@@ -217,6 +219,43 @@ fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
             }
         }
         let out = ctx.envelope.proof(mission, operation);
+        return (out.status, out.body);
+    }
+    // --- WorkGraph type (Phase 3) : transitions sous enveloppe et
+    // surface d'interrogation bornee du PRD section 5
+    if req.method == "POST" && (path_only == "/workgraph/transition" || path_only == "/workgraph/reconcile") {
+        let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let out = if path_only == "/workgraph/transition" {
+            ctx.workgraph.transition(&body)
+        } else {
+            ctx.workgraph.reconcile(&body)
+        };
+        return (out.status, out.body);
+    }
+    if req.method == "GET" && path_only.starts_with("/workgraph/") {
+        let query = req.path.split('?').nth(1).unwrap_or("");
+        let mut mission = "";
+        let mut hop = "";
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "mission_id" => mission = v,
+                    "hop_id" => hop = v,
+                    _ => {}
+                }
+            }
+        }
+        let out = match path_only {
+            "/workgraph/mission" => ctx.workgraph.mission(mission),
+            "/workgraph/assertion" => ctx.workgraph.assertion(mission, hop),
+            "/workgraph/eligible" => ctx.workgraph.eligible(mission),
+            "/workgraph/lease-holder" => ctx.workgraph.lease_holder(mission),
+            "/workgraph/pending-reconciliations" => ctx.workgraph.pending_reconciliations(),
+            _ => crate::envelope::Outcome {
+                status: 404,
+                body: json!({"error": {"code": "NOT_FOUND", "message": "surface WorkGraph inexistante — la surface d'interrogation est bornee (PRD Phase 3, section 5)"}}),
+            },
+        };
         return (out.status, out.body);
     }
     let state = ctx.state.read().unwrap();

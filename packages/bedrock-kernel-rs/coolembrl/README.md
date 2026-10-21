@@ -59,6 +59,41 @@ réconciliation de l'inventaire des promotions
 reste un **inconnu nommé** : aucun enrôlement n'est supposé ni exécuté
 dans cette phase.
 
+## WorkGraph type — Phase 3 (D-N039)
+
+Le daemon tient l'**état d'exécution** des missions (PRD Phase 3 du
+13e, design signé de Clara) — le registre des missions reste l'objet de
+Nardole ; le WorkGraph prouve où chaque exécution en est, hop par hop.
+Le modèle est à **liste de champs fermée** : aucun champ de dispatch
+n'existe ici, l'assignation vit au registre.
+
+- `POST /workgraph/transition` — (état, événement, enveloppe) → état' :
+  création de hop (8 `kind` fermés par le PRD), statut, tentative
+  d'effet, mise à jour d'`envelope_ref` — elle-même une transition,
+  présentée sous le bail successeur : la succession se prouve dans le
+  graphe. Toute mutation passe par le point de contrôle unique de la
+  Phase 2 (`authorize()`) et par le store, qui refuse un token fencé à
+  l'écriture. Idempotence `(mission, hop, transition_key)` : une
+  redélivrance est un no-op détecté, jamais un second effet.
+  `recorded_at` n'est **jamais** un champ d'entrée : le store le pose.
+- **Sémantique UNKNOWN** : un effet tenté non observé est
+  `ATTEMPTED_UNKNOWN` ; ses dépendants sont bloqués **à la transition**
+  autant qu'à la liste. Il ne se résout que par
+  `POST /workgraph/reconcile`, sur l'état réel, avec un `source_read`
+  **typé** `{system, locator, observed_value}` — un récit en texte
+  libre est refusé à l'écriture, par la forme. Ni le timeout, ni
+  l'hypothèse, ni le récit de l'agent, ni la succession de bail ne
+  résolvent un UNKNOWN.
+- `GET /workgraph/mission`, `/eligible`, `/lease-holder`,
+  `/pending-reconciliations` (âge des UNKNOWN exposé, **sans seuil** —
+  l'exploitation appartient au watchdog de la Phase 4),
+  `/assertion` (charges utiles en JSON opaque : le contrat #64 est
+  respecté par construction).
+- **Rejeu honnête** : l'état vit au store (schéma v3) ; tuer le daemon
+  à n'importe quelle frontière de hop et redémarrer rend un état
+  canonique identique, et un effet en cours à l'arrêt lit
+  `ATTEMPTED_UNKNOWN` — jamais promu, jamais réinitialisé.
+
 ## Configuration (environnement)
 
 | Variable | Défaut | Rôle |
@@ -83,7 +118,11 @@ démarrer si son store vise une strate non persistante détectable
 et dépose les évidences (reçus, mesures, journaux) dans un répertoire
 horodaté. `scripts/run_holdouts_phase2.py` exécute les preuves H-P2 de la
 Phase 2 (les quatre preuves de l'issue #2 en exécution + complétude du
-modèle) et `authority/check_profiles.py` les hold-outs H-PA-1 → H-PA-4. Les chiffres de boot publiés sont **mesurés** (étiquette « mesuré »,
+modèle) et `authority/check_profiles.py` les hold-outs H-PA-1 → H-PA-4.
+`scripts/run_holdouts_phase3.py` exécute les preuves H-P3 du WorkGraph
+(15 preuves : les dix du PRD, les trois extensions de Clara, la
+succession dans le graphe et la file d'observation), dont le cycle
+complet de mission en namespace réseau isolé. Les chiffres de boot publiés sont **mesurés** (étiquette « mesuré »,
 matériel de référence `amd64-generic`), jamais déclarés : la cible « T1 < 3 s »
 est une cible de design, pas un fait.
 

@@ -23,6 +23,7 @@ mod policy;
 mod server;
 mod store;
 mod timefmt;
+mod workgraph;
 
 use envelope::EnvelopeService;
 use journal::Journal;
@@ -266,12 +267,17 @@ fn main() {
             cfg.mcp_bind
         ));
     }
+    let envelope_service = Arc::new(EnvelopeService {
+        store: ctx.store.as_ref().unwrap().clone(),
+        policy_dir: cfg.policy_dir.clone(),
+    });
     let server_ctx = Arc::new(ServerCtx {
         state: state.clone(),
         journal: journal.clone(),
-        envelope: Arc::new(EnvelopeService {
+        envelope: envelope_service.clone(),
+        workgraph: Arc::new(workgraph::WorkGraph {
             store: ctx.store.as_ref().unwrap().clone(),
-            policy_dir: cfg.policy_dir.clone(),
+            envelope: envelope_service,
         }),
     });
     {
