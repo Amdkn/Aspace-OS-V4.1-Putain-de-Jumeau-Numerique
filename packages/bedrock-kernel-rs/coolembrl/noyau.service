@@ -1,0 +1,31 @@
+[Unit]
+Description=Noyau A1 — daemon du BedRock (CoolEmbrl 1.0)
+After=network.target local-fs.target
+# Les volumes de donnees du daemon doivent etre montes AVANT le demarrage
+# (interface hote du PRD Phase 1, section 6) : ajuster RequiresMountsFor
+# au deploiement reel.
+RequiresMountsFor=/var/lib/noyau
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/noyau
+Restart=on-failure
+RestartSec=2
+User=noyau
+Group=noyau
+Environment=NOYAU_DATA_DIR=/var/lib/noyau
+Environment=NOYAU_API_BIND=127.0.0.1:7474
+Environment=NOYAU_MCP_BIND=127.0.0.1:7475
+Environment=NOYAU_BOARD_ID=amd64-generic
+Environment=NOYAU_HEARTBEAT_SECS=30
+# Battement interimaire vers la trace L00 (format interimaire en vigueur) :
+# Environment=NOYAU_L00_TRACE=/chemin/vers/L00-ETAT.md
+# Enregistrement au registre canonique H-04 :
+# Environment=NOYAU_REGISTRY_PATH=/chemin/vers/registre/noyau.json
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/noyau
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
