@@ -1,0 +1,15 @@
+{
+  "api_bind": "127.0.0.1:17474",
+  "board_id": "amd64-generic",
+  "boot_id": "boot-20261021174304-24787db3",
+  "kind": "mcp-server",
+  "mcp_bind": "127.0.0.1:17475",
+  "mcp_tools": [
+    "daemon_status",
+    "boot_state",
+    "boot_receipt_last"
+  ],
+  "name": "noyau",
+  "registered_at": "2026-10-21T17:43:04Z",
+  "version": "0.1.0"
+}

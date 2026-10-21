@@ -1,0 +1,33 @@
+# Manifeste du daemon noyau — format propre du programme (holon-app.yml).
+# Le format et le nom sont les notres (heritage de design D-N030) ; les
+# formats de manifestes de daemons tiers sont exclus (liste negative,
+# annexe B7).
+name: noyau
+version: 0.1.0
+kind: daemon
+summary: Daemon du Noyau A1 — boot T0/T1, recu de boot R10 a chaque demarrage, surfaces lecture seule.
+binary: noyau
+unit: noyau.service
+mcp:
+  server: noyau
+  groups:
+    daemon:
+      tools:
+        - daemon_status
+        - boot_state
+        - boot_receipt_last
+  mutating_tools: []
+api:
+  read_only: true
+  routes:
+    - GET /health
+    - GET /boot
+    - GET /state
+anchor:
+  mechanism: ABSENT # mecanisme d'enveloppe : Phase 2
+  policy: DENY_ALL
+  capabilities_granted: 0
+watchdog:
+  status: NOT_INSTALLED # service N2 : Phase 4
+  slot: GET /state (champ watchdog)
+provenance: clean-room — code original du programme, aucune reprise de code tiers de daemon.

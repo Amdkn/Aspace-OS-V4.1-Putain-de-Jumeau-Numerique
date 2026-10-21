@@ -1,0 +1,345 @@
+//! Surfaces du daemon en T1 (liste fermee du design Phase 1, section 2.3) :
+//! - API lecture seule : GET /health, GET /boot, GET /state. Aucune route
+//!   d'ecriture d'etat n'existe.
+//! - Serveur MCP (lecture seule) : groupe `daemon` = daemon_status,
+//!   boot_state, boot_receipt_last. Aucun outil mutant n'est enregistre —
+//!   plus fort que le refus : l'absence (design section 0.5).
+//! - Surface d'ancrage : POST /anchor ne fait qu'une chose — refuser, de
+//!   facon typee, toute mutation presentee (design section 0.4). Elle
+//!   n'ecrit aucun etat ; chaque presentation est consignee au journal.
+
+use crate::journal::Journal;
+use crate::timefmt;
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+pub const MCP_TOOLS: [&str; 3] = ["daemon_status", "boot_state", "boot_receipt_last"];
+
+#[derive(Clone)]
+pub struct AnchorState {
+    pub mechanism: &'static str, // "ABSENT" en Phase 1 — honnetete par construction
+    pub policy: &'static str,    // "DENY_ALL"
+    pub capabilities_granted: i64,
+}
+
+impl AnchorState {
+    pub fn phase1() -> Self {
+        AnchorState {
+            mechanism: "ABSENT",
+            policy: "DENY_ALL",
+            capabilities_granted: 0,
+        }
+    }
+    pub fn to_json(&self) -> Value {
+        json!({
+            "mechanism": self.mechanism,
+            "mechanism_note": "mecanisme d'enveloppe : Phase 2",
+            "policy": self.policy,
+            "capabilities_granted": self.capabilities_granted,
+        })
+    }
+    /// La seule reponse de l'ancrage en Phase 1 : un refus type.
+    /// Toute reponse en forme de succes ou de bail simule serait une
+    /// violation de design (H-P1-8).
+    pub fn refusal(&self, presented: &Value) -> Value {
+        json!({
+            "error": {
+                "code": "ANCHOR_DENY_ALL",
+                "type": "typed_refusal",
+                "message": "ancrage d'autorite en deny-by-default : aucune mutation n'est servie en Phase 1",
+                "anchor": self.to_json(),
+                "presented_kind": presented.get("kind").cloned().unwrap_or(Value::Null),
+            }
+        })
+    }
+}
+
+pub struct DaemonState {
+    pub boot_id: String,
+    pub daemon_version: String,
+    pub board_id: String,
+    pub stage: String, // "T0" pendant le boot, "T1" apres declaration
+    pub t0_unix: i64,
+    pub stage_marks: Vec<(String, String)>, // (etape, iso8601)
+    pub store_integrity: String,
+    pub anchor: AnchorState,
+    pub last_receipt: Option<Value>,
+    pub anomalies: Vec<String>,
+}
+
+impl DaemonState {
+    pub fn state_json(&self) -> Value {
+        json!({
+            "daemon": "noyau",
+            "daemon_version": self.daemon_version,
+            "board_id": self.board_id,
+            "stage": self.stage,
+            "t2_ready_at": Value::Null,
+            "watchdog": "NOT_INSTALLED",
+            "watchdog_note": "emplacement prepare ; service N2 : Phase 4",
+            "store_integrity": self.store_integrity,
+            "anchor": self.anchor.to_json(),
+            "anomalies": self.anomalies,
+        })
+    }
+    pub fn boot_json(&self) -> Value {
+        let stages: Vec<Value> = self
+            .stage_marks
+            .iter()
+            .map(|(s, at)| json!({"stage": s, "at": at}))
+            .collect();
+        json!({
+            "boot_id": self.boot_id,
+            "stage": self.stage,
+            "stages": stages,
+            "last_receipt": self.last_receipt,
+        })
+    }
+}
+
+pub struct ServerCtx {
+    pub state: Arc<RwLock<DaemonState>>,
+    pub journal: Arc<Journal>,
+}
+
+// ---------- transport HTTP minimal (std uniquement) ----------
+
+struct Request {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<Request> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end;
+    loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            header_end = pos + 4;
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return None,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 1_048_576 {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = head.lines();
+    let first = lines.next()?;
+    let mut parts = first.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    body.truncate(content_length);
+    Some(Request { method, path, body })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
+    let text = body.to_string();
+    let reason = match status {
+        200 => "OK",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "Error",
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        text.len(),
+        text
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+// ---------- API ----------
+
+fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
+    let state = ctx.state.read().unwrap();
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/health") => (
+            200,
+            json!({"status": "ok", "daemon": "noyau", "stage": state.stage, "boot_id": state.boot_id}),
+        ),
+        ("GET", "/boot") => (200, state.boot_json()),
+        ("GET", "/state") => (200, state.state_json()),
+        ("POST", "/anchor") => {
+            // Surface d'ancrage : refus type, consigne au journal.
+            let presented: Value =
+                serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let refusal = state.anchor.refusal(&presented);
+            drop(state);
+            ctx.journal.append(&json!({
+                "kind": "anchor-refusal",
+                "boot_id": ctx.state.read().unwrap().boot_id,
+                "at": timefmt::iso8601_utc(timefmt::now_unix_secs()),
+                "presented": presented,
+                "decision": "DENIED",
+                "code": "ANCHOR_DENY_ALL",
+            }));
+            (403, refusal)
+        }
+        ("GET", _) | ("POST", _) => (
+            404,
+            json!({"error": {"code": "NOT_FOUND", "message": "surface inexistante — la liste des surfaces de T1 est fermee (design Phase 1, section 2.3)"}}),
+        ),
+        _ => (
+            405,
+            json!({"error": {"code": "METHOD_NOT_ALLOWED", "message": "API lecture seule ; la surface d'ancrage ne sert que des refus types"}}),
+        ),
+    }
+}
+
+// ---------- MCP (JSON-RPC 2.0 sur HTTP) ----------
+
+fn mcp_tool_result(ctx: &ServerCtx, name: &str) -> Value {
+    let state = ctx.state.read().unwrap();
+    match name {
+        "daemon_status" => state.state_json(),
+        "boot_state" => state.boot_json(),
+        "boot_receipt_last" => state
+            .last_receipt
+            .clone()
+            .unwrap_or(json!({"note": "aucun recu emis pour le boot courant pour l'instant"})),
+        _ => json!({"error": "outil inconnu"}),
+    }
+}
+
+fn handle_mcp(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
+    if req.method != "POST" {
+        return (
+            405,
+            json!({"error": {"code": "METHOD_NOT_ALLOWED", "message": "le serveur MCP noyau attend des requetes JSON-RPC en POST"}}),
+        );
+    }
+    let rpc: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                200,
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": format!("parse error: {e}")}}),
+            )
+        }
+    };
+    let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "noyau", "version": ctx.state.read().unwrap().daemon_version},
+        }),
+        "tools/list" => json!({
+            "tools": [
+                {"name": "daemon_status", "description": "Etat du daemon noyau (stade, store, ancrage, watchdog).", "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "boot_state", "description": "Etapes du boot courant et dernier recu.", "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "boot_receipt_last", "description": "Dernier recu de boot emis (R10).", "inputSchema": {"type": "object", "properties": {}}},
+            ]
+        }),
+        "tools/call" => {
+            let name = rpc
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if MCP_TOOLS.contains(&name) {
+                let value = mcp_tool_result(ctx, name);
+                json!({"content": [{"type": "text", "text": value.to_string()}], "isError": false})
+            } else {
+                json!({"content": [{"type": "text", "text": format!("outil non enregistre : {name} — en Phase 1, seuls les outils de lecture du groupe daemon existent ; aucun outil mutant n'est enregistre")}], "isError": true})
+            }
+        }
+        "ping" => json!({}),
+        _ => {
+            return (
+                200,
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("methode inconnue : {method}")}}),
+            )
+        }
+    };
+    (200, json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+// ---------- boucle d'acceptation ----------
+
+pub fn serve(listener: TcpListener, ctx: Arc<ServerCtx>, is_mcp: bool) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut s) => {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                    if let Some(req) = read_request(&mut s) {
+                        let (status, body) = if is_mcp {
+                            handle_mcp(&ctx, &req)
+                        } else {
+                            handle_api(&ctx, &req)
+                        };
+                        respond(&mut s, status, &body);
+                    }
+                });
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+// ---------- client minimal pour les auto-sondes (S6) ----------
+
+pub fn http_request(bind: &str, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
+    let mut stream = TcpStream::connect(bind).map_err(|e| format!("connexion {bind}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("timeout: {e}"))?;
+    let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {bind}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("envoi: {e}"))?;
+    let mut raw = String::new();
+    stream
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("lecture: {e}"))?;
+    let status: u16 = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "reponse HTTP illisible".to_string())?;
+    let body_text = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+    let value: Value = serde_json::from_str(body_text).unwrap_or(Value::Null);
+    Ok((status, value))
+}
