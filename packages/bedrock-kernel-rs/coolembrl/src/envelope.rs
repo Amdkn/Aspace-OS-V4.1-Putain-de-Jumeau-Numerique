@@ -26,6 +26,16 @@ pub struct Outcome {
     pub body: Value,
 }
 
+/// Presentation autorisee par le point de controle unique : le bail
+/// verifie, sa trace d'autorisation, et l'enveloppe telle qu'emise.
+pub struct Authorized {
+    pub mission: String,
+    pub operation: String,
+    pub token: i64,
+    pub trace_id: i64,
+    pub stored_envelope: Value,
+}
+
 fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key)
         .and_then(|x| x.as_str())
@@ -44,7 +54,10 @@ impl EnvelopeService {
 
     /// Refus type, TRACE AVANT le retour (H-P2-9) : chaque refus porte
     /// l'identifiant de sa trace ; un refus sans trace est une violation.
-    fn refusal(
+    /// Variante a store deja tenu par l'appelant (le WorkGraph tient le
+    /// verrou pendant ses gardes) ; traced_refusal() est la variante qui
+    /// prend le verrou.
+    pub(crate) fn refusal(
         &self,
         store: &Store,
         status: u16,
@@ -229,42 +242,45 @@ impl EnvelopeService {
         }
     }
 
-    /// Presentation d'une mutation au point d'effet : verification complete,
-    /// trace d'autorisation AVANT l'effet, effet porte au store (qui refuse
-    /// lui-meme un token fence — couplage ecrit des deux cotes).
-    pub fn effect(&self, req: &Value) -> Outcome {
+    /// Refus type et trace, pour les consommateurs du point de controle
+    /// (WorkGraph, Phase 3) : meme discipline que les refus du service —
+    /// aucun refus ne part sans sa trace.
+    pub fn traced_refusal(&self, status: u16, code: &str, message: &str, mission: Option<&str>, operation: Option<&str>, token: Option<i64>, detail: Value) -> Outcome {
         let store = self.store.lock().unwrap();
-        let env = req.get("envelope").cloned().unwrap_or(Value::Null);
-        let eff = req.get("effect").cloned().unwrap_or(Value::Null);
-        let mission_hint = s(&env, "mission_id");
-        let operation_hint = s(&env, "operation_id");
-        // --- forme
+        self.refusal(&store, status, code, message, mission, operation, token, detail)
+    }
+
+    /// Verification complete d'une presentation de mutation et trace
+    /// d'autorisation AVANT l'effet : forme de l'enveloppe, bail emis et
+    /// conforme, fencing courant, expiration au point d'effet, politique
+    /// relue, capacite, budget. C'est LE point de controle unique
+    /// (design Phase 2, 0.5) : /envelope/effect et le WorkGraph (Phase 3)
+    /// passent par ici, aucun autre chemin n'autorise.
+    pub fn authorize(&self, env: &Value, effect_class: &str, head_sha: &str, cost: i64, required_capability: Option<&str>) -> Result<Authorized, Outcome> {
+        let store = self.store.lock().unwrap();
+        let mission_hint = s(env, "mission_id");
+        let operation_hint = s(env, "operation_id");
         let token_hint = env.pointer("/lease/fencing_token").and_then(|t| t.as_i64());
         let form_ok = ["work_id", "mission_id", "operation_id", "correlation_id", "return_to"]
-            .iter().all(|f| s(&env, f).is_some())
+            .iter().all(|f| s(env, f).is_some())
             && env.pointer("/lease/holder").and_then(|h| h.as_str()).is_some()
             && token_hint.is_some()
-            && s(&eff, "effect_class").is_some()
-            && s(&eff, "head_sha").is_some();
-        let issued_ok = env.pointer("/lease/issued_at_unix").and_then(|x| x.as_i64()).is_some()
+            && env.pointer("/lease/issued_at_unix").and_then(|x| x.as_i64()).is_some()
             && env.pointer("/lease/expires_at_unix").and_then(|x| x.as_i64()).is_some();
-        if !form_ok || !issued_ok {
-            return self.refusal(&store, 400, "ENVELOPE_MALFORMED",
-                "enveloppe ou effet malforme : identifiants, bail complet, effect_class et head_sha sont requis",
-                mission_hint.as_deref(), operation_hint.as_deref(), token_hint, json!({}));
+        if !form_ok {
+            return Err(self.refusal(&store, 400, "ENVELOPE_MALFORMED",
+                "enveloppe malforme : identifiants, return_to et bail complet sont requis",
+                mission_hint.as_deref(), operation_hint.as_deref(), token_hint, json!({})));
         }
         let mission = mission_hint.unwrap();
         let operation = operation_hint.unwrap();
         let token = token_hint.unwrap();
-        let effect_class = s(&eff, "effect_class").unwrap();
-        let head_sha = s(&eff, "head_sha").unwrap();
-        let cost = i(&eff, "cost").unwrap_or(1).max(1);
         let now = self.now();
         // --- le bail doit avoir ete emis par ce service
         let Some((holder, state, _issued, expires, stored_env_json)) = store.get_lease(&mission, token) else {
-            return self.refusal(&store, 403, "LEASE_UNKNOWN",
+            return Err(self.refusal(&store, 403, "LEASE_UNKNOWN",
                 "aucun bail emis sous cette mission et ce token — un claim sans bail ne produit aucun effet (claim orphelin)",
-                Some(&mission), Some(&operation), Some(token), json!({}));
+                Some(&mission), Some(&operation), Some(token), json!({})));
         };
         // --- l'enveloppe presentee doit etre celle qui a ete emise
         let stored_env: Value = serde_json::from_str(&stored_env_json).unwrap_or(Value::Null);
@@ -273,58 +289,58 @@ impl EnvelopeService {
             && stored_env.pointer("/lease/holder").and_then(|h| h.as_str()) == env.pointer("/lease/holder").and_then(|h| h.as_str())
             && stored_env.pointer("/lease/holder").and_then(|h| h.as_str()) == Some(holder.as_str());
         if !subset_ok {
-            return self.refusal(&store, 403, "ENVELOPE_MISMATCH",
+            return Err(self.refusal(&store, 403, "ENVELOPE_MISMATCH",
                 "l'enveloppe presentee n'est pas celle qui a ete emise sous ce token",
-                Some(&mission), Some(&operation), Some(token), json!({}));
+                Some(&mission), Some(&operation), Some(token), json!({})));
         }
         // --- fencing : le token presente doit etre le token courant
         let current = store.current_token(&mission);
         if state == "fenced" || token != current {
-            return self.refusal(&store, 403, "FENCED",
+            return Err(self.refusal(&store, 403, "FENCED",
                 "bail fence : un bail successeur a token superieur gouverne cette mission ; l'ancien holder ne peut plus agir",
-                Some(&mission), Some(&operation), Some(token), json!({"current_token": current}));
+                Some(&mission), Some(&operation), Some(token), json!({"current_token": current})));
         }
         // --- expiration du bail, au point d'effet
         if now > expires {
             let _ = store.set_lease_state(&mission, token, "expired");
-            return self.refusal(&store, 403, "LEASE_EXPIRED",
+            return Err(self.refusal(&store, 403, "LEASE_EXPIRED",
                 "bail perime refuse au point d'effet — aucun effet produit",
                 Some(&mission), Some(&operation), Some(token),
-                json!({"expires_at": timefmt::iso8601_utc(expires)}));
+                json!({"expires_at": timefmt::iso8601_utc(expires)})));
         }
         // --- politique relue au moment de la decision
         match self.load_policy() {
             Ok(snap) if snap.in_force() => {}
             Ok(snap) => {
-                return self.refusal(&store, 403, "POLICY_NOT_IN_FORCE",
+                return Err(self.refusal(&store, 403, "POLICY_NOT_IN_FORCE",
                     "le policy store relu n'est pas en vigueur",
                     Some(&mission), Some(&operation), Some(token),
-                    json!({"policy_ref_read": snap.policy_ref()}));
+                    json!({"policy_ref_read": snap.policy_ref()})));
             }
             Err(e) => {
-                return self.refusal(&store, 403, "POLICY_NOT_IN_FORCE",
+                return Err(self.refusal(&store, 403, "POLICY_NOT_IN_FORCE",
                     &format!("policy store illisible : {e}"),
-                    Some(&mission), Some(&operation), Some(token), json!({}));
+                    Some(&mission), Some(&operation), Some(token), json!({})));
             }
         }
         // --- capacite requise : permanente, ou promotion vivante
-        if let Some(required) = s(&eff, "required_capability") {
+        if let Some(required) = required_capability {
             let permanent = stored_env.pointer("/capabilities/permanent").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-            if !permanent.iter().any(|c| c.as_str() == Some(required.as_str())) {
+            if !permanent.iter().any(|c| c.as_str() == Some(required)) {
                 let promos = stored_env.pointer("/capabilities/promotions").and_then(|c| c.as_array()).cloned().unwrap_or_default();
-                match promos.iter().find(|p| s(p, "capability").as_deref() == Some(required.as_str())) {
+                match promos.iter().find(|p| s(p, "capability").as_deref() == Some(required)) {
                     Some(p) if i(p, "expires_at_unix").map(|e| e > now).unwrap_or(false) => {}
                     Some(p) => {
-                        return self.refusal(&store, 403, "PROMOTION_EXPIRED",
+                        return Err(self.refusal(&store, 403, "PROMOTION_EXPIRED",
                             "promotion expiree effectivement retiree : la capacite n'est plus accordee",
                             Some(&mission), Some(&operation), Some(token),
-                            json!({"capability": required, "promotion_expires_at_unix": i(p, "expires_at_unix")}));
+                            json!({"capability": required, "promotion_expires_at_unix": i(p, "expires_at_unix")})));
                     }
                     None => {
-                        return self.refusal(&store, 403, "CAPABILITY_ABSENT",
+                        return Err(self.refusal(&store, 403, "CAPABILITY_ABSENT",
                             "capacite requise absente de l'enveloppe (ni permanente, ni promotion)",
                             Some(&mission), Some(&operation), Some(token),
-                            json!({"capability": required}));
+                            json!({"capability": required})));
                     }
                 }
             }
@@ -336,15 +352,59 @@ impl EnvelopeService {
         let cap = if effect_class == "paid_fallback" {
             0
         } else {
-            caps.get(&effect_class).and_then(|v| v.as_i64()).unwrap_or(0)
+            caps.get(effect_class).and_then(|v| v.as_i64()).unwrap_or(0)
         };
         let spent = store.spent_for(&mission, token, &effect_class);
         if spent + cost > cap {
-            return self.refusal(&store, 403, "BUDGET_EXCEEDED",
+            return Err(self.refusal(&store, 403, "BUDGET_EXCEEDED",
                 "plafond par effet depasse pour cette classe — refus consigne",
                 Some(&mission), Some(&operation), Some(token),
-                json!({"effect_class": effect_class, "cap": cap, "spent": spent, "cost": cost}));
+                json!({"effect_class": effect_class, "cap": cap, "spent": spent, "cost": cost})));
         }
+        // --- trace d'autorisation AVANT l'effet (design 0.2)
+        let trace_id = match store.trace("AUTHORIZE", Some(&mission), Some(&operation), Some(token),
+            &json!({"effect_class": effect_class, "head_sha": head_sha, "cost": cost}).to_string(), now) {
+            Ok(id) => id,
+            Err(e) => {
+                return Err(Outcome { status: 500, body: json!({"error": {"code": "TRACE_WRITE_FAILED", "type": "system_fault", "message": format!("autorisation non tracee — effet refuse (fail-closed sur la preuve) : {e}")}}) });
+            }
+        };
+        Ok(Authorized {
+            mission,
+            operation,
+            token,
+            trace_id,
+            stored_envelope: stored_env,
+        })
+    }
+
+    /// Presentation d'une mutation au point d'effet : verification par
+    /// authorize() (point de controle unique), liaison de preuve, puis
+    /// l'effet porte au store — qui refuse lui-meme un token fence entre
+    /// l'autorisation et l'ecriture (couplage ecrit des deux cotes).
+    pub fn effect(&self, req: &Value) -> Outcome {
+        let env = req.get("envelope").cloned().unwrap_or(Value::Null);
+        let eff = req.get("effect").cloned().unwrap_or(Value::Null);
+        if s(&eff, "effect_class").is_none() || s(&eff, "head_sha").is_none() {
+            return self.traced_refusal(400, "ENVELOPE_MALFORMED",
+                "effet malforme : effect_class et head_sha sont requis",
+                s(&env, "mission_id").as_deref(), s(&env, "operation_id").as_deref(),
+                env.pointer("/lease/fencing_token").and_then(|t| t.as_i64()), json!({}));
+        }
+        let effect_class = s(&eff, "effect_class").unwrap();
+        let head_sha = s(&eff, "head_sha").unwrap();
+        let cost = i(&eff, "cost").unwrap_or(1).max(1);
+        let required = s(&eff, "required_capability");
+        let auth = match self.authorize(&env, &effect_class, &head_sha, cost, required.as_deref()) {
+            Ok(a) => a,
+            Err(outcome) => return outcome,
+        };
+        let mission = auth.mission.clone();
+        let operation = auth.operation.clone();
+        let token = auth.token;
+        let trace_id = auth.trace_id;
+        let now = self.now();
+        let store = self.store.lock().unwrap();
         // --- liaison de preuve : une nouvelle tete rend l'ancienne preuve
         // obsolete — jamais portee en silence (PRD 3.1, H-P2-7).
         for (eff_id, old_head, proof_state, _) in store.effects_for(&mission, &operation) {
@@ -358,14 +418,6 @@ impl EnvelopeService {
                 }
             }
         }
-        // --- trace d'autorisation AVANT l'effet (design 0.2)
-        let trace_id = match store.trace("AUTHORIZE", Some(&mission), Some(&operation), Some(token),
-            &json!({"effect_class": effect_class, "head_sha": head_sha, "cost": cost}).to_string(), now) {
-            Ok(id) => id,
-            Err(e) => {
-                return Outcome { status: 500, body: json!({"error": {"code": "TRACE_WRITE_FAILED", "type": "system_fault", "message": format!("autorisation non tracee — effet refuse (fail-closed sur la preuve) : {e}")}}) };
-            }
-        };
         // --- l'effet, porte au store (transition estampillee du token)
         match store.insert_effect(&mission, &operation, s(&env, "correlation_id").as_deref(),
             &effect_class, Some(&head_sha), cost, token, trace_id, now) {

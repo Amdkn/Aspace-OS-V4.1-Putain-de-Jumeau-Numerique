@@ -6,7 +6,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
-pub const STORE_SCHEMA_VERSION: i64 = 2;
+pub const STORE_SCHEMA_VERSION: i64 = 3;
 
 pub struct Store {
     pub conn: Connection,
@@ -75,6 +75,54 @@ impl Store {
                  trace_id INTEGER NOT NULL,
                  proof_state TEXT NOT NULL DEFAULT 'CURRENT',
                  at_unix INTEGER NOT NULL
+             );
+             -- Phase 3 (D-N039) : WorkGraph type d'execution.
+             CREATE TABLE IF NOT EXISTS wg_missions (
+                 mission_id TEXT PRIMARY KEY,
+                 work_id TEXT NOT NULL,
+                 envelope_ref TEXT,
+                 observed_at TEXT,
+                 recorded_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS wg_hops (
+                 mission_id TEXT NOT NULL,
+                 hop_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 lease_holder TEXT,
+                 fencing_token INTEGER,
+                 effect_state TEXT NOT NULL DEFAULT 'NOT_ATTEMPTED',
+                 effect_attempted_unix INTEGER,
+                 assertion_json TEXT,
+                 evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+                 recorded_at TEXT NOT NULL,
+                 PRIMARY KEY (mission_id, hop_id)
+             );
+             CREATE TABLE IF NOT EXISTS wg_transitions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 mission_id TEXT NOT NULL,
+                 hop_id TEXT NOT NULL,
+                 transition_key TEXT NOT NULL,
+                 event_type TEXT NOT NULL,
+                 fencing_token INTEGER NOT NULL,
+                 trace_id INTEGER NOT NULL,
+                 detail_json TEXT,
+                 recorded_unix INTEGER NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 UNIQUE (mission_id, hop_id, transition_key)
+             );
+             CREATE TABLE IF NOT EXISTS wg_reconciliations (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 mission_id TEXT NOT NULL,
+                 hop_id TEXT NOT NULL,
+                 resolved_to TEXT NOT NULL,
+                 source_system TEXT NOT NULL,
+                 source_locator TEXT NOT NULL,
+                 source_observed TEXT NOT NULL,
+                 read_at TEXT NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 evidence_ref TEXT
              );",
         )
         .map_err(|e| format!("schema: {e}"))?;
@@ -94,15 +142,16 @@ impl Store {
             }
             Some(v) => {
                 let v: i64 = v.parse().map_err(|_| format!("version de schema illisible: {v}"))?;
-                if v == 1 {
-                    // Migration additive v1 -> v2 : les tables Phase 2 sont
-                    // nouvelles (CREATE IF NOT EXISTS ci-dessus) ; aucune
-                    // donnee v1 n'est touchee.
+                if v < STORE_SCHEMA_VERSION {
+                    // Migrations additives (v1 -> v2 : enveloppe ; v2 -> v3 :
+                    // WorkGraph) : les nouvelles tables sont creees par les
+                    // CREATE IF NOT EXISTS ci-dessus ; aucune donnee
+                    // existante n'est touchee.
                     conn.execute(
                         "UPDATE meta SET value=?1 WHERE key='store_schema_version'",
                         [STORE_SCHEMA_VERSION.to_string()],
                     )
-                    .map_err(|e| format!("migration schema v1->v2: {e}"))?;
+                    .map_err(|e| format!("migration schema v{v} -> v{STORE_SCHEMA_VERSION}: {e}"))?;
                 } else if v != STORE_SCHEMA_VERSION {
                     return Err(format!(
                         "version de schema du store {v} != attendue {STORE_SCHEMA_VERSION}"
@@ -354,8 +403,7 @@ impl Store {
 
     /// Capacites actuellement accordees = somme des capacites des baux
     /// vivants (etat reel, jamais declare).
-    pub fn live_granted_count(&self, now_unix: i64) -> i64 {
-        let mut stmt = match self.conn.prepare(
+    pub fn live_granted_count(&self, now_unix: i64) -> i64 {        let mut stmt = match self.conn.prepare(
             "SELECT envelope_json FROM leases WHERE state='live' AND expires_unix > ?1",
         ) {
             Ok(s) => s,
@@ -385,5 +433,235 @@ impl Store {
         }
         total
     }
+
+    // ---------- Phase 3 : WorkGraph type ----------
+
+    pub fn wg_upsert_mission(
+        &self,
+        mission_id: &str,
+        work_id: &str,
+        envelope_ref: Option<&str>,
+        recorded_at: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO wg_missions(mission_id, work_id, envelope_ref, recorded_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(mission_id) DO NOTHING",
+                rusqlite::params![mission_id, work_id, envelope_ref, recorded_at],
+            )
+            .map_err(|e| format!("mission du WorkGraph: {e}"))?;
+        Ok(())
+    }
+
+    /// (work_id, envelope_ref, observed_at, recorded_at)
+    pub fn wg_get_mission(&self, mission_id: &str) -> Option<(String, Option<String>, Option<String>, String)> {
+        self.conn
+            .query_row(
+                "SELECT work_id, envelope_ref, observed_at, recorded_at FROM wg_missions WHERE mission_id=?1",
+                [mission_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn wg_set_mission_envelope(&self, mission_id: &str, envelope_ref: &str, recorded_at: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE wg_missions SET envelope_ref=?2, recorded_at=?3 WHERE mission_id=?1",
+                rusqlite::params![mission_id, envelope_ref, recorded_at],
+            )
+            .map_err(|e| format!("envelope_ref de la mission: {e}"))?;
+        Ok(())
+    }
+
+    pub fn wg_set_mission_observed(&self, mission_id: &str, observed_at: &str, recorded_at: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE wg_missions SET observed_at=?2, recorded_at=?3 WHERE mission_id=?1",
+                rusqlite::params![mission_id, observed_at, recorded_at],
+            )
+            .map_err(|e| format!("observed_at de la mission: {e}"))?;
+        Ok(())
+    }
+
+    pub fn wg_hops(&self, mission_id: &str) -> Vec<HopRow> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT hop_id, seq, kind, status, lease_holder, fencing_token, effect_state,
+                    effect_attempted_unix, assertion_json, evidence_refs_json, recorded_at
+             FROM wg_hops WHERE mission_id=?1 ORDER BY seq",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([mission_id], |r| {
+            Ok(HopRow {
+                hop_id: r.get(0)?,
+                seq: r.get(1)?,
+                kind: r.get(2)?,
+                status: r.get(3)?,
+                lease_holder: r.get(4)?,
+                fencing_token: r.get(5)?,
+                effect_state: r.get(6)?,
+                effect_attempted_unix: r.get(7)?,
+                assertion_json: r.get(8)?,
+                evidence_refs_json: r.get(9)?,
+                recorded_at: r.get(10)?,
+            })
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn wg_get_hop(&self, mission_id: &str, hop_id: &str) -> Option<HopRow> {
+        self.wg_hops(mission_id).into_iter().find(|h| h.hop_id == hop_id)
+    }
+
+    pub fn wg_insert_hop(
+        &self,
+        mission_id: &str,
+        hop_id: &str,
+        seq: i64,
+        kind: &str,
+        status: &str,
+        holder: &str,
+        fencing_token: i64,
+        assertion_json: Option<&str>,
+        recorded_at: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO wg_hops(mission_id, hop_id, seq, kind, status, lease_holder, fencing_token, assertion_json, recorded_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![mission_id, hop_id, seq, kind, status, holder, fencing_token, assertion_json, recorded_at],
+            )
+            .map_err(|e| format!("insertion du hop: {e}"))?;
+        Ok(())
+    }
+
+    pub fn wg_update_hop(
+        &self,
+        mission_id: &str,
+        hop_id: &str,
+        status: &str,
+        effect_state: &str,
+        effect_attempted_unix: Option<i64>,
+        holder: &str,
+        fencing_token: i64,
+        evidence_refs_json: &str,
+        recorded_at: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE wg_hops SET status=?3, effect_state=?4, effect_attempted_unix=?5,
+                        lease_holder=?6, fencing_token=?7, evidence_refs_json=?8, recorded_at=?9
+                 WHERE mission_id=?1 AND hop_id=?2",
+                rusqlite::params![mission_id, hop_id, status, effect_state, effect_attempted_unix, holder, fencing_token, evidence_refs_json, recorded_at],
+            )
+            .map_err(|e| format!("mise a jour du hop: {e}"))?;
+        Ok(())
+    }
+
+    pub fn wg_transition_id(&self, mission_id: &str, hop_id: &str, transition_key: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT id FROM wg_transitions WHERE mission_id=?1 AND hop_id=?2 AND transition_key=?3",
+                rusqlite::params![mission_id, hop_id, transition_key],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Ecriture d'une transition AU STORE : le store refuse une transition
+    /// presentee sous un token qui n'est pas le token courant de la mission
+    /// (exigence 2.4 de la qualification stockage, ecrite des deux cotes —
+    /// le service verifie, le store refuse).
+    pub fn wg_insert_transition(
+        &self,
+        mission_id: &str,
+        hop_id: &str,
+        transition_key: &str,
+        event_type: &str,
+        fencing_token: i64,
+        trace_id: i64,
+        detail_json: &str,
+        recorded_unix: i64,
+        recorded_at: &str,
+    ) -> Result<i64, String> {
+        let current = self.current_token(mission_id);
+        if fencing_token != current {
+            return Err(format!(
+                "transition refusee au store : token {fencing_token} != token courant {current} (bail fence ou expire)"
+            ));
+        }
+        self.conn
+            .execute(
+                "INSERT INTO wg_transitions(mission_id, hop_id, transition_key, event_type, fencing_token, trace_id, detail_json, recorded_unix, recorded_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![mission_id, hop_id, transition_key, event_type, fencing_token, trace_id, detail_json, recorded_unix, recorded_at],
+            )
+            .map_err(|e| format!("insertion de la transition: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn wg_insert_reconciliation(
+        &self,
+        mission_id: &str,
+        hop_id: &str,
+        resolved_to: &str,
+        source_system: &str,
+        source_locator: &str,
+        source_observed: &str,
+        read_at: &str,
+        recorded_at: &str,
+        evidence_ref: &str,
+    ) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO wg_reconciliations(mission_id, hop_id, resolved_to, source_system, source_locator, source_observed, read_at, recorded_at, evidence_ref)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![mission_id, hop_id, resolved_to, source_system, source_locator, source_observed, read_at, recorded_at, evidence_ref],
+            )
+            .map_err(|e| format!("insertion de la reconciliation: {e}"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// (mission_id, hop_id, effect_attempted_unix) des effets en
+    /// ATTEMPTED_UNKNOWN, toutes missions — la file d'observation du PRD 5.
+    pub fn wg_pending_unknown(&self) -> Vec<(String, String, Option<i64>)> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT mission_id, hop_id, effect_attempted_unix FROM wg_hops
+             WHERE effect_state='ATTEMPTED_UNKNOWN' ORDER BY effect_attempted_unix",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)));
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HopRow {
+    pub hop_id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub status: String,
+    pub lease_holder: Option<String>,
+    pub fencing_token: Option<i64>,
+    pub effect_state: String,
+    pub effect_attempted_unix: Option<i64>,
+    pub assertion_json: Option<String>,
+    pub evidence_refs_json: String,
+    pub recorded_at: String,
 }
 

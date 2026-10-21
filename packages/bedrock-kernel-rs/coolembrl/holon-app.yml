@@ -27,6 +27,13 @@ api:
     - POST /envelope/effect
     - GET /envelope/state
     - GET /envelope/proof
+    - POST /workgraph/transition
+    - POST /workgraph/reconcile
+    - GET /workgraph/mission
+    - GET /workgraph/eligible
+    - GET /workgraph/lease-holder
+    - GET /workgraph/pending-reconciliations
+    - GET /workgraph/assertion
 anchor:
   mechanism: ABSENT # ACTIVE seulement apres l'acte d'activation post-preuves H-P2
   policy: DENY_ALL # surface brute /anchor : refus types uniquement
