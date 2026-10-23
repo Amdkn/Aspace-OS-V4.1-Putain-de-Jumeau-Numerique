@@ -401,6 +401,138 @@ impl Store {
         Ok(())
     }
 
+    // ---------- Phase 4 : veille N2 ----------
+
+    /// Lecture generique de la table meta (cle -> valeur, ou None).
+    pub fn meta_get(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+    }
+
+    pub fn meta_set_pub(&self, key: &str, value: &str) -> Result<(), String> {
+        self.meta_set(key, value, key)
+    }
+
+    fn meta_set(&self, key: &str, value: &str, ctx: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [key, value],
+            )
+            .map_err(|e| format!("{ctx}: {e}"))?;
+        Ok(())
+    }
+
+    /// t2_ready_at : champ a ecriture unique, mecaniquement.
+    /// - refuse toute ecriture pre-bascule : le seul ecrivain legitime est
+    ///   l'acte de bascule (design section 0.5) ; la commande operateur
+    ///   `veille-switchover` verifie la fenetre de concordance avant d'appeler.
+    /// - refuse toute seconde ecriture : la valeur unique est l'horodatage
+    ///   de l'acte de bascule (H-P4-12).
+    pub fn set_t2_ready_at(&self, iso: &str) -> Result<(), String> {
+        if self.meta_get("t2_ready_at").is_some() {
+            return Err("T2_ALREADY_SET: t2_ready_at est a ecriture unique (H-P4-12)".into());
+        }
+        self.meta_set("t2_ready_at", iso, "t2_ready_at")
+    }
+
+    pub fn t2_ready_at(&self) -> Option<String> {
+        self.meta_get("t2_ready_at")
+    }
+
+    /// Stade du protocole de relais : A (ombre), B (concordance),
+    /// C (bascule consignée), D (veille du veilleur). Defaut A.
+    pub fn veille_stage(&self) -> String {
+        self.meta_get("veille_stage").unwrap_or_else(|| "A".to_string())
+    }
+
+    pub fn set_veille_stage(&self, stage: &str) -> Result<(), String> {
+        if !["A", "B", "C", "D"].contains(&stage) {
+            return Err(format!("stade de veille inconnu: {stage}"));
+        }
+        self.meta_set("veille_stage", stage, "veille_stage")
+    }
+
+    /// Version de spec implementee par le service veille (rapporte a
+    /// chaque cycle ; un ecart avec la version courante = anomalie de
+    /// maintenance, H-P4-10).
+    pub fn veille_spec_version(&self) -> Option<String> {
+        self.meta_get("veille_spec_version")
+    }
+
+    pub fn set_veille_spec_version(&self, v: &str) -> Result<(), String> {
+        self.meta_set("veille_spec_version", v, "veille_spec_version")
+    }
+
+    /// Compteur de cycles concordants consecutifs (stade B) et debut de
+    /// la fenetre courante. Toute discordance remet le compteur a zero
+    /// (design section 0.3).
+    pub fn veille_concordant(&self) -> i64 {
+        self.meta_get("veille_concordant")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn set_veille_concordant(&self, n: i64) -> Result<(), String> {
+        self.meta_set("veille_concordant", &n.to_string(), "veille_concordant")
+    }
+
+    pub fn veille_window_start(&self) -> Option<i64> {
+        self.meta_get("veille_window_start")
+            .and_then(|v| v.parse().ok())
+    }
+
+    pub fn set_veille_window_start(&self, unix: i64) -> Result<(), String> {
+        self.meta_set("veille_window_start", &unix.to_string(), "veille_window_start")
+    }
+
+    /// Instantane des baux vivants : (mission_id, holder, expires_unix, issued_unix).
+    pub fn live_leases_snapshot(&self) -> Vec<(String, String, i64, i64)> {
+        let mut out = Vec::new();
+        let mut stmt = match self.conn.prepare(
+            "SELECT mission_id, holder, expires_unix, issued_unix FROM leases WHERE state='live'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+        out
+    }
+
+    /// Derniere transition par mission (recorded_unix max) — mesure la
+    /// progression pour le motif "cale sans crash".
+    pub fn mission_last_transition(&self) -> std::collections::HashMap<String, i64> {
+        let mut out = std::collections::HashMap::new();
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT mission_id, MAX(recorded_unix) FROM wg_transitions GROUP BY mission_id")
+        {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for row in rows.flatten() {
+                out.insert(row.0, row.1);
+            }
+        }
+        out
+    }
+
     /// Capacites actuellement accordees = somme des capacites des baux
     /// vivants (etat reel, jamais declare).
     pub fn live_granted_count(&self, now_unix: i64) -> i64 {        let mut stmt = match self.conn.prepare(

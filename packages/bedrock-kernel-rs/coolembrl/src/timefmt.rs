@@ -20,6 +20,18 @@ pub fn iso8601_utc(unix_secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// Heure locale America/New_York en periode d'ete (UTC-4), format des
+/// traces du programme : `2026-10-23 12:19 EDT`.
+pub fn iso8601_edt(unix_secs: i64) -> String {
+    let e = unix_secs - 4 * 3600;
+    let days = e.div_euclid(86_400);
+    let secs = e.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = secs / 3600;
+    let mm = (secs % 3600) / 60;
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} EDT")
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

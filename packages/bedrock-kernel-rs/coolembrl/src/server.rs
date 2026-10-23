@@ -18,7 +18,14 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-pub const MCP_TOOLS: [&str; 3] = ["daemon_status", "boot_state", "boot_receipt_last"];
+pub const MCP_TOOLS: [&str; 6] = [
+    "daemon_status",
+    "boot_state",
+    "boot_receipt_last",
+    "veille_status",
+    "veille_last_beat",
+    "veille_observations",
+];
 
 /// Etat de l'ancrage, lu EN DIRECT au store (Phase 2) : le mecanisme est
 /// ABSENT jusqu'a l'acte d'activation, puis ACTIVE (design Phase 2, 0.1) ;
@@ -66,15 +73,14 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub fn state_json(&self, anchor: &Value) -> Value {
+    pub fn state_json(&self, anchor: &Value, watchdog: &Value) -> Value {
         json!({
             "daemon": "noyau",
             "daemon_version": self.daemon_version,
             "board_id": self.board_id,
             "stage": self.stage,
-            "t2_ready_at": Value::Null,
-            "watchdog": "NOT_INSTALLED",
-            "watchdog_note": "emplacement prepare ; service N2 : Phase 4",
+            "t2_ready_at": watchdog.get("t2_ready_at").cloned().unwrap_or(Value::Null),
+            "watchdog": watchdog,
             "store_integrity": self.store_integrity,
             "anchor": anchor,
             "anomalies": self.anomalies,
@@ -100,6 +106,7 @@ pub struct ServerCtx {
     pub journal: Arc<Journal>,
     pub envelope: Arc<EnvelopeService>,
     pub workgraph: Arc<WorkGraph>,
+    pub veille: Arc<crate::veille::Veille>,
 }
 
 fn live_anchor(ctx: &ServerCtx) -> Value {
@@ -108,6 +115,21 @@ fn live_anchor(ctx: &ServerCtx) -> Value {
         st.get("mechanism").and_then(|m| m.as_str()).unwrap_or("ABSENT"),
         st.get("capabilities_granted").and_then(|c| c.as_i64()).unwrap_or(0),
     )
+}
+
+/// Etat vivant du watchdog N2 (H-P4-9/H-P4-10) : stade du relais, version de
+/// spec rapportee, t2_ready_at (null jusqu'a la bascule).
+fn live_watchdog(ctx: &ServerCtx) -> Value {
+    let t2: Value = ctx.veille.store_t2().map(Value::String).unwrap_or(Value::Null);
+    let stade = ctx.veille.store_stage();
+    json!({
+        "service": "veille",
+        "source_trace": crate::veille::TRACE_SOURCE,
+        "spec_version": crate::veille::SPEC_VERSION,
+        "stade": stade,
+        "autoritaire": matches!(stade.as_str(), "C" | "D"),
+        "t2_ready_at": t2,
+    })
 }
 
 // ---------- transport HTTP minimal (std uniquement) ----------
@@ -267,7 +289,8 @@ fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
         ("GET", "/boot") => (200, state.boot_json()),
         ("GET", "/state") => {
             let anchor = live_anchor(ctx);
-            (200, state.state_json(&anchor))
+            let watchdog = live_watchdog(ctx);
+            (200, state.state_json(&anchor, &watchdog))
         }
         ("POST", "/anchor") => {
             // Surface d'ancrage brute : refus type, consigne au journal.
@@ -306,12 +329,15 @@ fn handle_api(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
 fn mcp_tool_result(ctx: &ServerCtx, name: &str) -> Value {
     let state = ctx.state.read().unwrap();
     match name {
-        "daemon_status" => state.state_json(&live_anchor(ctx)),
+        "daemon_status" => state.state_json(&live_anchor(ctx), &live_watchdog(ctx)),
         "boot_state" => state.boot_json(),
         "boot_receipt_last" => state
             .last_receipt
             .clone()
             .unwrap_or(json!({"note": "aucun recu emis pour le boot courant pour l'instant"})),
+        "veille_status" => ctx.veille.status_json(),
+        "veille_last_beat" => ctx.veille.last_beat_json(),
+        "veille_observations" => ctx.veille.observations_json(),
         _ => json!({"error": "outil inconnu"}),
     }
 }
@@ -345,6 +371,9 @@ fn handle_mcp(ctx: &ServerCtx, req: &Request) -> (u16, Value) {
                 {"name": "daemon_status", "description": "Etat du daemon noyau (stade, store, ancrage, watchdog).", "inputSchema": {"type": "object", "properties": {}}},
                 {"name": "boot_state", "description": "Etapes du boot courant et dernier recu.", "inputSchema": {"type": "object", "properties": {}}},
                 {"name": "boot_receipt_last", "description": "Dernier recu de boot emis (R10).", "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "veille_status", "description": "Etat du watchdog N2 : stade du relais, spec, autorite, t2_ready_at, concordance.", "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "veille_last_beat", "description": "Dernier battement ecrit a la trace par N2.", "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "veille_observations", "description": "Verdicts par item W1-W7 du dernier cycle de veille.", "inputSchema": {"type": "object", "properties": {}}},
             ]
         }),
         "tools/call" => {
