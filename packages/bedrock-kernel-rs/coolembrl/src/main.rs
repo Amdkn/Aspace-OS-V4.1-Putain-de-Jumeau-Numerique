@@ -23,6 +23,7 @@ mod policy;
 mod server;
 mod store;
 mod timefmt;
+mod veille;
 mod workgraph;
 
 use envelope::EnvelopeService;
@@ -55,6 +56,18 @@ struct Config {
     registry_path: Option<PathBuf>,
     policy_dir: Option<PathBuf>,
     heartbeat_secs: u64,
+    // Phase 4 — service veille (N2).
+    veille_interval_secs: u64,
+    veille_trace: Option<PathBuf>,
+    veille_outbox: Option<PathBuf>,
+    veille_report: Option<PathBuf>,
+    veille_registry: Option<PathBuf>,
+    veille_interim_trace: Option<PathBuf>,
+    veille_journal_dir: Option<PathBuf>,
+    veille_workspace: Option<PathBuf>,
+    veille_bearers: Option<PathBuf>,
+    veille_gh_stub: Option<PathBuf>,
+    veille_spec_courante: Option<PathBuf>,
 }
 
 impl Config {
@@ -72,7 +85,44 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            veille_interval_secs: std::env::var("NOYAU_VEILLE_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(veille::INTERVAL_SECS_DEFAULT),
+            veille_trace: std::env::var("NOYAU_VEILLE_TRACE").ok().map(PathBuf::from),
+            veille_outbox: std::env::var("NOYAU_VEILLE_OUTBOX").ok().map(PathBuf::from),
+            veille_report: std::env::var("NOYAU_VEILLE_REPORT").ok().map(PathBuf::from),
+            veille_registry: std::env::var("NOYAU_VEILLE_REGISTRY").ok().map(PathBuf::from),
+            veille_interim_trace: std::env::var("NOYAU_VEILLE_INTERIM_TRACE").ok().map(PathBuf::from),
+            veille_journal_dir: std::env::var("NOYAU_VEILLE_JOURNAL_DIR").ok().map(PathBuf::from),
+            veille_workspace: std::env::var("NOYAU_VEILLE_WORKSPACE").ok().map(PathBuf::from),
+            veille_bearers: std::env::var("NOYAU_VEILLE_BEARERS").ok().map(PathBuf::from),
+            veille_gh_stub: std::env::var("NOYAU_VEILLE_GH_STUB").ok().map(PathBuf::from),
+            veille_spec_courante: std::env::var("NOYAU_VEILLE_SPEC_COURANTE").ok().map(PathBuf::from),
         }
+    }
+}
+
+/// Chemins du service veille resolus depuis la Config (defauts : les
+/// emplacements reels du programme sous $HOME).
+fn veille_paths(cfg: &Config) -> veille::VeillePaths {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let h = |rel: &str| PathBuf::from(&home).join(rel);
+    let policy_dir = cfg
+        .policy_dir
+        .clone()
+        .unwrap_or_else(|| h("workspace/v4-capabilities/policy"));
+    veille::VeillePaths {
+        registry: cfg.veille_registry.clone().unwrap_or_else(|| h("workspace/v4-factory/dispatch/REGISTRE-NARDOLE.md")),
+        interim_trace: cfg.veille_interim_trace.clone().unwrap_or_else(|| h("workspace/v4-factory/dispatch/L00-ETAT.md")),
+        trace: cfg.veille_trace.clone().unwrap_or_else(|| h("workspace/v4-factory/dispatch/L00-N2-ETAT.md")),
+        outbox: cfg.veille_outbox.clone().unwrap_or_else(|| cfg.data_dir.join("veille-outbox.jsonl")),
+        concordance_report: cfg.veille_report.clone().unwrap_or_else(|| cfg.data_dir.join("veille-concordance.json")),
+        policy_dir,
+        journal_dir: cfg.veille_journal_dir.clone().unwrap_or_else(|| h("memory")),
+        workspace_root: cfg.veille_workspace.clone().unwrap_or_else(|| h("workspace")),
+        bearers_map: cfg.veille_bearers.clone().unwrap_or_else(|| cfg.data_dir.join("veille-bearers.json")),
+        spec_courante: cfg.veille_spec_courante.clone(),
     }
 }
 
@@ -98,6 +148,40 @@ fn fs_magic(dir: &std::path::Path) -> Option<u64> {
 
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const RAMFS_MAGIC: u64 = 0x8584_58f6;
+
+/// t2_ready_at porte au recu de boot : null jusqu'a la bascule, l'horodatage
+/// de l'acte ensuite (H-P4-9). Un recu pre-bascule le portant non nul est un
+/// echec de hold-out, pas une avance (design section 0.5 : ecriture unique,
+/// mecanique).
+fn t2_value(store: &Option<Arc<Mutex<store::Store>>>) -> Value {
+    store
+        .as_ref()
+        .and_then(|s| s.lock().ok())
+        .and_then(|s| s.t2_ready_at())
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
+/// Etat du watchdog N2 porte au recu de boot et a l'etat du daemon.
+fn watchdog_boot_json(store: &Option<Arc<Mutex<store::Store>>>) -> Value {
+    let (stade, spec) = store
+        .as_ref()
+        .and_then(|s| s.lock().ok())
+        .map(|s| {
+            (
+                s.veille_stage(),
+                s.veille_spec_version().unwrap_or_else(|| "non posee".into()),
+            )
+        })
+        .unwrap_or(("?".into(), "?".into()));
+    json!({
+        "service": "veille",
+        "source_trace": veille::TRACE_SOURCE,
+        "spec_version": spec,
+        "stade": stade,
+        "autoritaire": stade == "C" || stade == "D",
+    })
+}
 
 fn main() {
     // Acte d'activation de l'ancrage (Phase 2, design 0.1) : le mecanisme
@@ -131,6 +215,85 @@ fn main() {
             Err(e) => {
                 eprintln!("noyau: anchor-activate FAILED — store illisible: {e}");
                 std::process::exit(2);
+            }
+        }
+    }
+    // Cycle unique de veille (Phase 4) : surface d'operateur pour les
+    // fixtures H-P4 — execute un cycle reel contre le binaire et emet le
+    // rapport en JSON. La configuration passe par l'environnement
+    // (NOYAU_VEILLE_*), comme en production.
+    if std::env::args().nth(1).as_deref() == Some("veille-cycle-once") {
+        let cfg = Config::from_env();
+        let store_path = cfg.data_dir.join("noyau-store.sqlite");
+        match Store::open(&store_path) {
+            Ok(store) => {
+                let paths = veille_paths(&cfg);
+                let slot = Arc::new(Mutex::new(None));
+                let v = veille::Veille::new(
+                    Arc::new(Mutex::new(store)),
+                    paths,
+                    cfg.veille_interval_secs,
+                    cfg.veille_gh_stub.clone(),
+                    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())),
+                    slot,
+                );
+                let snap = veille::DaemonSnapshot {
+                    stage: "T1".into(),
+                    store_integrity: "OK".into(),
+                    anchor_mechanism: "ABSENT".into(),
+                };
+                match v.run_cycle(timefmt::now_unix_secs(), &snap) {
+                    Ok(r) => {
+                        println!("{}", r.to_json());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("noyau: veille-cycle-once FAILED — {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("noyau: veille-cycle-once FAILED — store illisible: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    // et le rollback sont des actes d'operateur mecaniquement gates — jamais
+    // des glissements. La bascule exige un rapport de concordance complet
+    // (H-P4-11) ; elle ecrit t2_ready_at exactement une fois (H-P4-12).
+    if let Some(cmd) = std::env::args().nth(1) {
+        if cmd == "veille-switchover" || cmd == "veille-rollback" {
+            let cfg = Config::from_env();
+            let store_path = cfg.data_dir.join("noyau-store.sqlite");
+            match Store::open(&store_path) {
+                Ok(store) => {
+                    let paths = veille_paths(&cfg);
+                    let now = timefmt::now_unix_secs();
+                    let res = if cmd == "veille-switchover" {
+                        veille::veille_switchover(&store, &paths, now)
+                    } else {
+                        veille::veille_rollback(&store, &paths, now)
+                    };
+                    match res {
+                        Ok(receipt) => {
+                            let _ = store.trace(
+                                if cmd == "veille-switchover" { "VEILLE_SWITCHOVER" } else { "VEILLE_ROLLBACK" },
+                                None, None, None, &receipt, now,
+                            );
+                            println!("noyau: {cmd} OK — {receipt}");
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("noyau: {cmd} REFUSE — {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("noyau: {cmd} FAILED — store illisible: {e}");
+                    std::process::exit(2);
+                }
             }
         }
     }
@@ -279,6 +442,14 @@ fn main() {
             store: ctx.store.as_ref().unwrap().clone(),
             envelope: envelope_service,
         }),
+        veille: Arc::new(veille::Veille::new(
+            ctx.store.as_ref().unwrap().clone(),
+            veille_paths(&cfg),
+            cfg.veille_interval_secs,
+            cfg.veille_gh_stub.clone(),
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())),
+            Arc::new(Mutex::new(None)),
+        )),
     });
     {
         let c = server_ctx.clone();
@@ -381,7 +552,8 @@ fn main() {
         "board_id": cfg.board_id,
         "t0_at": ctx.t0_at,
         "t1_at": t1_at,
-        "t2_ready_at": Value::Null,
+        "t2_ready_at": t2_value(&ctx.store),
+        "watchdog": watchdog_boot_json(&ctx.store),
         "d_t1_ms": d_t1_ms,
         "store_integrity": "OK",
         "replay": {"hops_replayed": hops, "effects_unknown_pending": unknown},
@@ -397,7 +569,7 @@ fn main() {
         st.anomalies = ctx.anomalies.clone();
     }
     println!(
-        "noyau: T1 atteint — boot {boot_id}, d_t1_ms={d_t1_ms} (mesure), ancrage DENY_ALL (mecanisme ABSENT, Phase 2), watchdog NOT_INSTALLED (Phase 4)"
+        "noyau: T1 atteint — boot {boot_id}, d_t1_ms={d_t1_ms} (mesure), ancrage DENY_ALL (mecanisme ABSENT, Phase 2), veille N2 stade A — ombre (Phase 4)"
     );
 
     // ---------- battement interimaire vers la trace L00 ----------
@@ -432,6 +604,51 @@ fn main() {
                     }
                 }
                 None => println!("{line}"),
+            }
+        }
+    });
+
+    // ---------- service veille N2 : cycles horaires ----------
+    // Stade A a l'installation : l'ombre bat, ecrit sa trace, ne route rien.
+    // La bascule (stade C) est un acte d'operateur (`veille-switchover`),
+    // jamais un glissement du thread.
+    let veille_ctx = server_ctx.veille.clone();
+    let veille_state = state.clone();
+    let veille_envelope = server_ctx.envelope.clone();
+    let _veille_thread = std::thread::spawn(move || {
+        let mut waited = 0u64;
+        let interval_ms = veille_ctx.interval_secs * 1000;
+        // Premier cycle immediat : le premier battement N2 existe des le boot.
+        let mut first = true;
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            if !first {
+                while waited < interval_ms && !SHUTDOWN.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    waited += 200;
+                }
+                waited = 0;
+            }
+            first = false;
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            let snap = {
+                let st = veille_state.read().unwrap();
+                let anchor = veille_envelope
+                    .state_json()
+                    .get("mechanism")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                veille::DaemonSnapshot {
+                    stage: st.stage.clone(),
+                    store_integrity: st.store_integrity.clone(),
+                    anchor_mechanism: anchor,
+                }
+            };
+            let now = timefmt::now_unix_secs();
+            if let Err(e) = veille_ctx.run_cycle(now, &snap) {
+                eprintln!("noyau: veille — cycle en echec : {e}");
             }
         }
     });
@@ -504,7 +721,8 @@ impl<'a> BootCtx<'a> {
             "board_id": self.cfg.board_id,
             "t0_at": self.t0_at,
             "t1_at": Value::Null,
-            "t2_ready_at": Value::Null,
+            "t2_ready_at": t2_value(&self.store),
+            "watchdog": watchdog_boot_json(&self.store),
             "d_t1_ms": Value::Null,
             "store_integrity": if store_open { "OK" } else { "NOT_REACHED" },
             "replay": if store_open {

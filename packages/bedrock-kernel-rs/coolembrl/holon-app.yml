@@ -16,6 +16,11 @@ mcp:
         - daemon_status
         - boot_state
         - boot_receipt_last
+    veille: # Phase 4 (D-N041) — lecture + etat uniquement, aucun outil mutant
+      tools:
+        - veille_status
+        - veille_last_beat
+        - veille_observations
   mutating_tools: []
 api:
   read_only: true # hors service d'enveloppe (Phase 2)

@@ -195,7 +195,15 @@ def main():
            and not lease_shaped)
     note("H-P1-8", ok8, "requete en forme de bail + demande d'octroi -> refus types ANCHOR_DENY_ALL ; mechanism ABSENT, capabilities_granted 0 ; aucune reponse en forme de bail")
     # /state n'a jamais rapporte T2
-    note("H-P1-9b", state["stage"] == "T1" and state["watchdog"] == "NOT_INSTALLED", "etat rapporte : T1, watchdog NOT_INSTALLED")
+    # AMENDEMENT D-N041 (Phase 4) : l'invariant "watchdog NOT_INSTALLED" est
+    # remplace par design — le watchdog N2 existe desormais, en stade A
+    # (ombre, non autoritaire). L'invariant qui demeure : stade A, non
+    # autoritaire, t2_ready_at null (aucun faux T2, aucune autorite prematuree).
+    wd = state["watchdog"]
+    ok9b = (state["stage"] == "T1" and isinstance(wd, dict)
+            and wd.get("service") == "veille" and wd.get("stade") == "A"
+            and wd.get("autoritaire") is False and wd.get("t2_ready_at") is None)
+    note("H-P1-9b", ok9b, "etat rapporte : T1, watchdog veille stade A (ombre, non autoritaire), t2 null")
     d.stop()
 
     # ---------- H-P1-4 : kill -9 pendant le boot, recuperation ----------
